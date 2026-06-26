@@ -1,0 +1,44 @@
+name: Deploy React App to AWS
+
+on:
+  push:
+    branches:
+      - main # מריץ את התהליך בכל פעם שדוחפים קוד לענף main
+
+permissions:
+  id-token: write # דרוש לחיבור OIDC מול AWS
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        working-directory: ./Terraform/tf+cicd/app
+        run: npm ci
+
+      - name: Build the app
+        working-directory: ./Terraform/tf+cicd/app
+        run: npm run build
+
+      - name: Configure AWS Credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::143301474428:role/cloud-academy-react-github-actions-role
+          aws-region: us-east-1
+
+      - name: Deploy to S3
+        working-directory: ./Terraform/tf+cicd/app/dist
+        run: aws s3 sync . s3://cloud-academy-react-frontend-bucket --delete
+
+      - name: Invalidate CloudFront Cache
+        run: aws cloudfront create-invalidation --distribution-id E2KBAT2DAZU29M --paths "/*"
