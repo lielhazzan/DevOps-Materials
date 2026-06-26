@@ -43,6 +43,22 @@ match this JSON exactly.
 3. **Service or use case:** **Elastic Container Service** → select **Elastic Container Service Task** → **Next**.
 4. In **Permissions policies** search `AmazonECSTaskExecutionRolePolicy`, tick it → **Next**.
 5. **Role name:** `ecsTaskExecutionRole`. Leave description and trust policy as generated → **Create role**.
+6. **Add log-group create permission.** The managed policy lets the role write log
+   *streams* but **not create a log group**. The `awslogs` driver tries to create
+   the group on task start, so without this the task dies with
+   `AccessDeniedException ... logs:CreateLogGroup`. Open the new role → **Add
+   permissions** → **Create inline policy** → **JSON**, paste:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Action": "logs:CreateLogGroup",
+       "Resource": "arn:aws:logs:*:*:log-group:/ecs/*"
+     }]
+   }
+   ```
+   Name it `allow-create-log-group` → **Create policy**.
 
 ---
 
@@ -105,38 +121,68 @@ You should now have two families — `inventory-service` and `orders-service` �
 
 ---
 
-## G2. Create the security groups
+## G2. Create the two security groups
 
-Create all three in the **default VPC**, **in this order** — each rule's source group must already exist:
+You need **two** security groups. The ECS new-service wizard attaches the
+service's own security group to the load balancer it creates, so the ALB and the
+orders task end up sharing **`orders-sg`** — there is no separate `alb-sg`. Model
+it that way from the start:
 
 ```
-internet ──80──► alb-sg ──80──► orders-sg ──8080──► inventory-sg
+internet ──80──► orders-sg (ALB + orders task) ──8080──► inventory-sg
+                       └──8080── self (ALB → orders task)
 ```
 
-Open **EC2 → Security Groups → Create security group**:
+> **Leave OUTBOUND at the default `All traffic → 0.0.0.0/0` on both groups.**
+> This is the single most important rule in this step. Fargate tasks use
+> **outbound** to (a) pull the image from **ECR/443**, (b) ship logs to
+> **CloudWatch**, (c) let the **ALB health-check** the task, and (d) let orders
+> reach inventory. If you restrict egress, you get one of these silent failures:
+> - egress missing 443 → `ResourceInitializationError: cannot pull registry auth from Amazon ECR ... i/o timeout` (task never starts)
+> - egress missing 8080 to self → ALB target stuck **`Target.Timeout`**, ALB returns 504, ECS kills/replaces the task in a loop
+> - egress missing 8080 to `inventory-sg` → `/orders` returns `{"error":"inventory service unavailable"}`
+>
+> Keep egress wide open (default). Lock down **inbound** only.
 
-1. **`alb-sg`** — **Description** `ALB inbound from internet`; VPC: default VPC.
-   - **Inbound:** **Type** **HTTP**, **Port** `80`, **Source** **Anywhere-IPv4** (`0.0.0.0/0`), **Description** `HTTP from internet`.
-   - Leave outbound at default → **Create security group**.
+Open **EC2 → Security Groups → Create security group**, create them **in this
+order** (the second references the first):
 
-2. **`orders-sg`** — **Description** `orders task, ALB only`; VPC: default VPC.
-   - **Inbound:** **Type** **Custom TCP**, **Port** `8080`, **Source** the **`alb-sg`** group, **Description** `8080 from alb-sg` → **Create security group**.
+1. **`orders-sg`** — holds the ALB *and* the orders task. **Description**
+   `ALB + orders task`; **VPC:** default VPC.
+   - **Inbound rule 1:** **Type** **HTTP**, **Port** `80`, **Source**
+     **Anywhere-IPv4** (`0.0.0.0/0`), **Description** `HTTP from internet to ALB`.
+   - **Inbound rule 2:** **Type** **Custom TCP**, **Port** `8080`, **Source**
+     **this same security group** (after you save once you can reference it; or
+     pick it from the dropdown as you type `orders-sg`), **Description**
+     `ALB to orders task`.
+   - **Outbound:** leave default **All traffic → `0.0.0.0/0`**.
+   - → **Create security group**.
 
-3. **`inventory-sg`** — **Description** `inventory task, orders only`; VPC: default VPC.
-   - **Inbound:** **Type** **Custom TCP**, **Port** `8080`, **Source** the **`orders-sg`** group, **Description** `8080 from orders-sg` → **Create security group**.
+   > Port `80` is the public ALB listener; port `8080` self-reference is the ALB
+   > forwarding to the orders container. Both live on this one group because the
+   > wizard puts the ALB here.
+
+2. **`inventory-sg`** — the inventory task only. **Description**
+   `inventory task, orders only`; **VPC:** default VPC.
+   - **Inbound:** **Type** **Custom TCP**, **Port** `8080`, **Source** the
+     **`orders-sg`** group, **Description** `8080 from orders-sg`.
+   - **Outbound:** leave default **All traffic → `0.0.0.0/0`**.
+   - → **Create security group**.
 
 ---
 
 ## Checklist
 
 - [ ] (A) `<ACCOUNT_ID>` and `<REGION>` filled into both `task-definition.json` files
-- [ ] (B) `ecsTaskExecutionRole` exists with `AmazonECSTaskExecutionRolePolicy`
+- [ ] (B) `ecsTaskExecutionRole` exists with `AmazonECSTaskExecutionRolePolicy` **and** the `allow-create-log-group` inline policy
 - [ ] (C) ECR repos `inventory-service` and `orders-service` exist (Private)
 - [ ] (D) Log groups `/ecs/inventory-service` and `/ecs/orders-service` exist
 - [ ] (E) Cluster `microsvc-cluster` exists on Fargate
 - [ ] (F) Cloud Map namespace `microsvc.local` exists in the default VPC
 - [ ] (G) A revision of each task definition is registered
-- [ ] (G2) Security groups exist: `alb-sg` (80 from `0.0.0.0/0`), `orders-sg` (8080 from `alb-sg`), `inventory-sg` (8080 from `orders-sg`)
+- [ ] (G2) `orders-sg` exists: inbound **80 from `0.0.0.0/0`** + **8080 from `orders-sg` (self)**
+- [ ] (G2) `inventory-sg` exists: inbound **8080 from `orders-sg`**
+- [ ] (G2) Both SGs keep **default allow-all outbound** (`All traffic → 0.0.0.0/0`) — egress carries ECR pull, ALB health check, and orders→inventory
 
 ## Next
 
